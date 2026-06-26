@@ -8,3 +8,4 @@ numpy
 psycopg2-binary
 python-dotenv
 xgboost
+groq
