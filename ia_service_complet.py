@@ -1,28 +1,50 @@
 """
 InnoFaso — Microservice IA (Flask)
 Prédiction de pannes correctives par équipement
+Données depuis PostgreSQL (vue matérialisée) avec repli Excel.
 
 Lancer: python ia_service_complet.py
 Tester: http://localhost:5001
 """
 
-from flask import Flask, jsonify, request
+import os
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
+
+from dotenv import load_dotenv
+load_dotenv()
+
+import json
+from flask import Flask, jsonify, request, Response, stream_with_context
 from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import joblib
-import os
+
+import db_loader
+
+try:
+    from nlp_service import classify_panne
+    NLP_AVAILABLE = True
+except Exception as e:
+    print(f"   [WARN] NLP service non disponible : {e}")
+    NLP_AVAILABLE = False
+
+    def classify_panne(text, use_llm=False):
+        return {'categorie': 'N/A', 'confiance': 0.0, 'mode': 'unavailable'}
 
 app = Flask(__name__)
 CORS(app)
 
-# ── Charger le modèle ─────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 model    = joblib.load(os.path.join(BASE_DIR, 'modele_panne_innofaso.pkl'))
 le_eq    = joblib.load(os.path.join(BASE_DIR, 'label_encoder_equipement.pkl'))
 features = joblib.load(os.path.join(BASE_DIR, 'features_liste.pkl'))
 
 EQUIPEMENTS = list(le_eq.classes_)
+LAG_MONTHS = [1, 2, 3]
 
 MOIS_NOMS = {
     1:'Janvier', 2:'Février', 3:'Mars', 4:'Avril',
@@ -30,96 +52,121 @@ MOIS_NOMS = {
     9:'Septembre', 10:'Octobre', 11:'Novembre', 12:'Décembre'
 }
 
-# ── Charger l'historique au démarrage ─────────────────────────
-DATA_PATH = os.path.join(BASE_DIR, 'INNOFASO_Historique_de_maintenance_2025.xlsx')
 
 def charger_historique():
-    df_raw = pd.read_excel(DATA_PATH, sheet_name='T_Maint_Innofaso', header=0)
-    df_raw.columns = ['Partenaire','Annee','Mois','Equipement','Sous_equip',
-                      'Type_maint','Duree_h','Description']
-    df = df_raw.dropna(subset=['Annee']).copy()
-    df['Annee'] = df['Annee'].astype(int)
-    df['Duree_h'] = pd.to_numeric(df['Duree_h'], errors='coerce').fillna(0)
-    mois_map = {
-        'Jan':1,'Feb':2,'Mar':3,'Apr':4,'May':5,'Jun':6,
-        'Jul':7,'Aug':8,'Sep':9,'Oct':10,'Nov':11,'Dec':12,
-        'jan':1,'jun':6
-    }
-    df['Mois_num'] = df['Mois'].map(mois_map)
-    df = df.dropna(subset=['Mois_num'])
-    df['Mois_num'] = df['Mois_num'].astype(int)
-    df = df[df['Type_maint'].isin(['Preventive','Corrective'])]
+    try:
+        df = db_loader.charger_donnees(source='auto')
+        print(f"   Source : {'PostgreSQL' if 'age_equipement_ans' in df.columns else 'Excel'}")
+        return df
+    except RuntimeError as e:
+        print(f"   [ERR] {e}")
+        return pd.DataFrame()
 
-    hist = df.groupby(['Annee','Mois_num','Equipement']).agg(
-        nb_interventions = ('Duree_h','count'),
-        duree_totale_h   = ('Duree_h','sum'),
-        duree_max_h      = ('Duree_h','max'),
-        nb_correctif     = ('Type_maint', lambda x: (x=='Corrective').sum()),
-    ).reset_index()
-    hist['pct_correctif'] = hist['nb_correctif'] / hist['nb_interventions']
-    return hist
 
-print("⏳ Chargement de l'historique...")
+print("[...] Chargement de l'historique...")
 HISTORIQUE = charger_historique()
-print(f"✅ Historique chargé : {len(HISTORIQUE)} lignes agrégées")
+SOURCE_TYPE = 'postgres' if 'age_equipement_ans' in HISTORIQUE.columns else 'excel'
+print(f"[OK] Historique chargé : {len(HISTORIQUE)} lignes depuis {'PostgreSQL' if SOURCE_TYPE == 'postgres' else 'Excel'}")
 
-# ── Préparer les features pour la prédiction ─────────────────
+
+def _v(val, default=0):
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return default
+    return val
+
+def get_lag_value(hist_eq, annee_cible, mois_cible, lag, col):
+    m = mois_cible - lag
+    a = annee_cible
+    while m <= 0:
+        m += 12
+        a -= 1
+    match = hist_eq[(hist_eq['annee'] == a) & (hist_eq['mois_num'] == m)]
+    if len(match) > 0:
+        val = match.iloc[0][col]
+        return float(val) if pd.notna(val) else 0.0
+    return 0.0
+
+
 def preparer_features(annee_cible, mois_cible):
     lignes = []
     for eq in EQUIPEMENTS:
-        hist_eq = HISTORIQUE[HISTORIQUE['Equipement']==eq].sort_values(['Annee','Mois_num'])
-
-        def get_lag(lag):
-            m = mois_cible - lag
-            a = annee_cible
-            while m <= 0:
-                m += 12; a -= 1
-            row = hist_eq[(hist_eq['Annee']==a) & (hist_eq['Mois_num']==m)]
-            return row.iloc[0] if len(row) > 0 else None
-
-        lags = [get_lag(i) for i in range(1, 4)]
-
-        def v(lr, col):
-            return float(lr[col]) if lr is not None and col in lr.index else 0.0
+        hist_eq = HISTORIQUE[HISTORIQUE['equipement_nom'] == eq].sort_values(['annee', 'mois_num'])
 
         row = {
-            'Equipement':          eq,
-            'Equipement_enc':      int(le_eq.transform([eq])[0]),
-            'Mois_num':            mois_cible,
-            'Annee':               annee_cible,
-            'trimestre':           (mois_cible - 1) // 3 + 1,
-            'mois_sin':            np.sin(2 * np.pi * mois_cible / 12),
-            'mois_cos':            np.cos(2 * np.pi * mois_cible / 12),
-            'duree_lag1':          v(lags[0], 'duree_totale_h'),
-            'duree_lag2':          v(lags[1], 'duree_totale_h'),
-            'duree_lag3':          v(lags[2], 'duree_totale_h'),
-            'nb_interv_lag1':      v(lags[0], 'nb_interventions'),
-            'nb_interv_lag2':      v(lags[1], 'nb_interventions'),
-            'nb_interv_lag3':      v(lags[2], 'nb_interventions'),
-            'nb_corr_lag1':        v(lags[0], 'nb_correctif'),
-            'nb_corr_lag2':        v(lags[1], 'nb_correctif'),
-            'nb_corr_lag3':        v(lags[2], 'nb_correctif'),
-            'pct_corr_lag1':       v(lags[0], 'pct_correctif'),
-            'pct_corr_lag2':       v(lags[1], 'pct_correctif'),
-            'pct_corr_lag3':       v(lags[2], 'pct_correctif'),
-            'duree_max_lag1':      v(lags[0], 'duree_max_h'),
-            'duree_max_lag2':      v(lags[1], 'duree_max_h'),
-            'rolling_nb_corr_3m':  sum(v(lags[i], 'nb_correctif') for i in range(3)),
-            'rolling_duree_3m':    np.mean([v(lags[i], 'duree_totale_h') for i in range(3)]),
+            'equipement': eq,
+            'equipement_enc': int(le_eq.transform([eq])[0]),
+            'mois_num': mois_cible,
+            'annee': annee_cible,
+            'trimestre': (mois_cible - 1) // 3 + 1,
+            'mois_sin': np.sin(2 * np.pi * mois_cible / 12),
+            'mois_cos': np.cos(2 * np.pi * mois_cible / 12),
         }
+
+        if SOURCE_TYPE == 'postgres':
+            derniere = hist_eq.iloc[-1] if len(hist_eq) > 0 else None
+            if derniere is not None:
+                row['age_equipement_ans'] = float(_v(derniere.get('age_equipement_ans'), 0))
+                row['nb_preventif_planifie'] = int(_v(derniere.get('nb_preventif_planifie'), 0))
+                row['nb_preventif_realise'] = int(_v(derniere.get('nb_preventif_realise'), 0))
+                row['nb_preventif_en_retard'] = int(_v(derniere.get('nb_preventif_en_retard'), 0))
+                row['taux_respect_preventif_pct'] = float(_v(derniere.get('taux_respect_preventif_pct'), 0))
+                row['taux_disponibilite_moyen'] = float(_v(derniere.get('taux_disponibilite_moyen'), 100))
+                row['taux_dispo_ligne'] = float(_v(derniere.get('taux_dispo_ligne'), 100))
+                row['nb_pieces_reference'] = int(_v(derniere.get('nb_pieces_reference'), 0))
+                row['stock_total_pieces'] = int(_v(derniere.get('stock_total_pieces'), 0))
+                row['nb_pieces_sous_seuil'] = int(_v(derniere.get('nb_pieces_sous_seuil'), 0))
+                row['duree_arret_moyenne_h'] = float(_v(derniere.get('duree_arret_moyenne_h'), 0))
+                row['duree_maintenance_moyenne_h'] = float(_v(derniere.get('duree_maintenance_moyenne_h'), 0))
+            else:
+                for col in ['age_equipement_ans', 'taux_respect_preventif_pct',
+                            'taux_disponibilite_moyen', 'taux_dispo_ligne',
+                            'duree_arret_moyenne_h', 'duree_maintenance_moyenne_h']:
+                    row[col] = 0.0
+                for col in ['nb_preventif_planifie', 'nb_preventif_realise',
+                            'nb_preventif_en_retard', 'nb_pieces_reference',
+                            'stock_total_pieces', 'nb_pieces_sous_seuil']:
+                    row[col] = 0
+        else:
+            row['duree_totale_h'] = 0.0
+            row['duree_max_h'] = 0.0
+
+        for lag in LAG_MONTHS:
+            row[f'nb_correctif_lag{lag}'] = get_lag_value(hist_eq, annee_cible, mois_cible, lag, 'nb_correctif')
+            if SOURCE_TYPE == 'postgres':
+                row[f'duree_arret_lag{lag}'] = get_lag_value(hist_eq, annee_cible, mois_cible, lag, 'duree_arret_total_h')
+                row[f'nb_interv_quart_lag{lag}'] = get_lag_value(hist_eq, annee_cible, mois_cible, lag, 'nb_interv_quart')
+            else:
+                row[f'duree_lag{lag}'] = get_lag_value(hist_eq, annee_cible, mois_cible, lag, 'duree_totale_h')
+
+        nb_corr_lags = sum(row.get(f'nb_correctif_lag{lag}', 0) for lag in LAG_MONTHS)
+        row['rolling_nb_correctif_3m'] = nb_corr_lags
+        row['rolling_correctif_trend'] = (
+            row.get('nb_correctif_lag1', 0) - row.get('nb_correctif_lag3', 0)
+        )
+
+        if SOURCE_TYPE == 'postgres':
+            duree_vals = [row.get(f'duree_arret_lag{lag}', 0) for lag in LAG_MONTHS]
+            row['rolling_duree_arret_3m'] = np.mean(duree_vals)
+        else:
+            duree_vals = [row.get(f'duree_lag{lag}', 0) for lag in LAG_MONTHS]
+            row['rolling_duree_3m'] = np.mean(duree_vals)
+
         lignes.append(row)
 
     return pd.DataFrame(lignes)
+
 
 def niveau_risque(proba):
     if proba >= 0.60: return 'ÉLEVÉ'
     if proba >= 0.38: return 'MODÉRÉ'
     return 'FAIBLE'
 
+
 def couleur_risque(proba):
     if proba >= 0.60: return 'red'
     if proba >= 0.38: return 'orange'
     return 'green'
+
 
 # ════════════════════════════════════════════════════════════════
 # ROUTES
@@ -185,14 +232,14 @@ def index():
   <div>
     <h1>⚡ InnoFaso — IA Prédiction de Pannes</h1>
   </div>
-  <span>v1.0 · ONLINE</span>
+  <span>v2.0 · ONLINE</span>
 </header>
 <main>
   <div class="stats">
-    <div class="stat"><div class="stat-num">15</div><div class="stat-lbl">Équipements</div></div>
-    <div class="stat"><div class="stat-num">1 884</div><div class="stat-lbl">Interventions</div></div>
-    <div class="stat"><div class="stat-num">5 ans</div><div class="stat-lbl">Historique</div></div>
-    <div class="stat"><div class="stat-num">0.73</div><div class="stat-lbl">AUC-ROC</div></div>
+    <div class="stat"><div class="stat-num">""" + str(len(EQUIPEMENTS)) + """</div><div class="stat-lbl">Équipements</div></div>
+    <div class="stat"><div class="stat-num">""" + str(len(HISTORIQUE)) + """</div><div class="stat-lbl">Lignes historiques</div></div>
+    <div class="stat"><div class="stat-num">""" + ('PostgreSQL' if SOURCE_TYPE == 'postgres' else 'Excel') + """</div><div class="stat-lbl">Source données</div></div>
+    <div class="stat"><div class="stat-num">XGBoost</div><div class="stat-lbl">Modèle</div></div>
   </div>
 
   <div class="card">
@@ -219,6 +266,32 @@ def index():
   </div>
 
   <div class="card">
+    <h2>🏷️ Classifier une cause</h2>
+    <div class="row">
+      <div style="flex:1">
+        <label>Texte de la cause</label>
+        <input type="text" id="classifyText" style="width:100%" placeholder="Ex: Fuite d'huile sur le vérin">
+      </div>
+      <button onclick="classify()" id="btnCls">Classifier</button>
+    </div>
+    <div id="classifyResult" style="margin-top:12px;font-size:14px"></div>
+  </div>
+
+  <div class="card">
+    <h2>💬 Assistant Maintenance</h2>
+    <div style="margin-bottom:8px;max-height:200px;overflow-y:auto;background:#f8fafc;border-radius:8px;padding:12px" id="chatBox">
+      <div style="color:#94a3b8;font-size:12px">Pose une question sur la maintenance, les équipements ou les pannes.</div>
+    </div>
+    <div class="row">
+      <div style="flex:1">
+        <input type="text" id="chatInput" style="width:100%" placeholder="Ex: Quel est le risque pour Filling machine en juillet ?"
+               onkeydown="if(event.key==='Enter') chat()">
+      </div>
+      <button onclick="chat()" id="btnChat">Envoyer</button>
+    </div>
+  </div>
+
+  <div class="card">
     <h2>📡 Endpoints API disponibles</h2>
     <div class="endpoints">
       <div class="ep">
@@ -232,6 +305,18 @@ def index():
       <div class="ep">
         <p>Équipements disponibles</p>
         <code>GET /api/equipements</code>
+      </div>
+      <div class="ep">
+        <p>Classifier une cause</p>
+        <code>POST /api/classify</code>
+      </div>
+      <div class="ep">
+        <p>Classifier (batch)</p>
+        <code>POST /api/classify/batch</code>
+      </div>
+      <div class="ep">
+        <p>Assistant maintenance</p>
+        <code>POST /api/bot/chat</code>
       </div>
       <div class="ep">
         <p>Santé du service</p>
@@ -297,6 +382,55 @@ async function predire() {
   }
   btn.disabled = false;
 }
+async function classify() {
+  const text = document.getElementById('classifyText').value.trim();
+  const btn  = document.getElementById('btnCls');
+  const div  = document.getElementById('classifyResult');
+  if (!text) { div.innerHTML = '<span style="color:#dc2626">Veuillez entrer un texte</span>'; return; }
+  btn.disabled = true;
+  div.innerHTML = '<span style="color:#94a3b8">Classification en cours...</span>';
+  try {
+    const r = await fetch('/api/classify', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text}) });
+    const d = await r.json();
+    const pct = (d.confiance * 100).toFixed(0);
+    const cls = d.confiance > 0.7 ? 'green' : d.confiance > 0.4 ? 'orange' : 'red';
+    div.innerHTML = `
+      <span style="font-weight:600">${d.categorie}</span>
+      <span class="badge badge-${cls}">${pct}%</span>
+      <span style="font-size:11px;color:#94a3b8;margin-left:8px">mode: ${d.mode}</span>`;
+  } catch(e) { div.innerHTML = `<span style="color:#dc2626">Erreur: ${e.message}</span>`; }
+  btn.disabled = false;
+}
+
+let chatHistory = [];
+
+async function chat() {
+  const input = document.getElementById('chatInput');
+  const box   = document.getElementById('chatBox');
+  const btn   = document.getElementById('btnChat');
+  const msg   = input.value.trim();
+  if (!msg) return;
+  box.innerHTML += `<div style="margin:4px 0"><b>Vous:</b> ${msg}</div>`;
+  input.value = '';
+  btn.disabled = true;
+  box.innerHTML += `<div style="margin:4px 0;color:#94a3b8">Assistant réfléchit...</div>`;
+  box.scrollTop = box.scrollHeight;
+  try {
+    const r = await fetch('/api/bot/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:msg, history:chatHistory}) });
+    const d = await r.json();
+    box.innerHTML = box.innerHTML.replace('<div style="margin:4px 0;color:#94a3b8">Assistant réfléchit...</div>', '');
+    box.innerHTML += `<div style="margin:4px 0;color:#0f172a"><b>Assistant:</b> ${d.reponse}</div>`;
+    chatHistory.push({role:'user', content:msg});
+    chatHistory.push({role:'assistant', content:d.reponse});
+    if (chatHistory.length > 20) chatHistory = chatHistory.slice(-20);
+  } catch(e) {
+    box.innerHTML = box.innerHTML.replace('<div style="margin:4px 0;color:#94a3b8">Assistant réfléchit...</div>', '');
+    box.innerHTML += `<div style="margin:4px 0;color:#dc2626">Erreur: ${e.message}</div>`;
+  }
+  box.scrollTop = box.scrollHeight;
+  btn.disabled = false;
+}
+
 // Lancer au chargement
 predire();
 </script>
@@ -305,19 +439,309 @@ predire();
 """
     return html
 
+
 @app.route('/api/health')
 def health():
     return jsonify({
         'status': 'ok',
         'service': 'InnoFaso IA — Prédiction de pannes',
-        'version': '1.0',
+        'version': '2.0',
+        'source_donnees': SOURCE_TYPE,
         'nb_equipements': len(EQUIPEMENTS),
-        'nb_lignes_historique': len(HISTORIQUE)
+        'nb_lignes_historique': len(HISTORIQUE),
+        'modele': type(model).__name__,
     })
+
 
 @app.route('/api/equipements')
 def get_equipements():
     return jsonify({'equipements': EQUIPEMENTS})
+
+
+@app.route('/api/classify', methods=['POST'])
+def api_classify():
+    data = request.get_json(silent=True)
+    if not data or 'text' not in data:
+        return jsonify({'error': 'Champ "text" requis'}), 400
+    text = data['text']
+    use_llm = data.get('use_llm', False)
+    result = classify_panne(text, use_llm=use_llm)
+    return jsonify(result)
+
+
+@app.route('/api/classify/batch', methods=['POST'])
+def api_classify_batch():
+    data = request.get_json(silent=True)
+    if not data or 'texts' not in data:
+        return jsonify({'error': 'Champ "texts" requis (liste de chaines)'}), 400
+    texts = data['texts']
+    use_llm = data.get('use_llm', False)
+    results = [classify_panne(t, use_llm=use_llm) for t in texts]
+    return jsonify({'results': results})
+
+
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+
+@app.route('/api/bot/chat', methods=['POST'])
+def bot_chat():
+    data = request.get_json(silent=True)
+    if not data or 'message' not in data:
+        return jsonify({'error': 'Champ "message" requis'}), 400
+    message = data['message'].strip()
+    history = data.get('history', [])
+
+    system_prompt = (
+        "Tu es un assistant expert en maintenance industrielle pour InnoFaso. "
+        "Tu connais les equipements (Air compressor, Filling machine, Mixer, Packing machine, etc.). "
+        "Tu aides a diagnostiquer les pannes, classer les causes et proposer des actions correctives. "
+        "Sois concis, technique et en francais."
+    )
+
+    msg_lower = message.lower()
+
+    # Detection: demande d'API explicite → rediriger
+    if any(w in msg_lower for w in ['api', 'endpoint', 'curl', 'postman']):
+        equipements_str = ', '.join(EQUIPEMENTS[:5]) + ', ...'
+        return jsonify({
+            'reponse': (
+                f"Endpoints disponibles:\n"
+                f"- GET /api/predict/ANNEE/MOIS → predictions par equipement\n"
+                f"- POST /api/classify → classer une cause (body: {{\"text\": \"...\"}})\n"
+                f"- POST /api/bot/chat → ce chatbot\n"
+                f"Equipements: {equipements_str}"
+            ),
+            'mode': 'regle',
+        })
+
+    # Detection: description d'une cause de panne → classifier automatiquement
+    cause_keywords = ['fuite', 'casse', 'rouille', 'usure', 'surchauffe', 'bruit', 'vibration',
+                      'bloque', 'dechire', 'courcircuit', 'surcharge', 'oxydation', 'frottement',
+                      'obstruction', 'bouchon', 'nettoyage', 'capteur', 'electrique', 'mecanique',
+                      'hydraulique', 'pneumatique']
+    if any(w in msg_lower for w in cause_keywords) and len(message) > 10:
+        try:
+            result = classify_panne(message)
+            categorie = result.get('categorie', 'Autre')
+            confiance = result.get('confiance', 0)
+            conf_pct = f"{confiance * 100:.0f}%"
+            suggestions = {
+                'Mecanique': 'Verifier l\'usure des pieces, graisser, remplacer si necessaire.',
+                'Electrique': 'Verifier le cablage, les fusibles, et les contacteurs.',
+                'Hydraulique/Fuite': 'Identifier la source de la fuite, remplacer joint ou flexible.',
+                'Instrumentation/Capteur': 'Nettoyer ou recalibrer le capteur, verifier la liaison.',
+                'Nettoyage/Obstruction': 'Nettoyer l\'equipement, enlever les obstructions.',
+                'Operateur/Utilisation': 'Former l\'operateur, verifier la procedure.',
+                'Preventif planifie': 'Operation de maintenance preventive prevue.',
+                'Autre': 'Diagnostic non standard, contacter le service technique.',
+            }
+            action = suggestions.get(categorie, '')
+            return jsonify({
+                'reponse': (
+                    f"Cause classée : **{categorie}** (confiance {conf_pct})\n\n"
+                    f"Action suggérée : {action}\n\n"
+                    f"Utilise le widget *Classifier une cause de panne* sur la page Equipements "
+                    f"pour tester d'autres descriptions."
+                ),
+                'mode': 'classify',
+            })
+        except Exception:
+            pass
+
+    # Detection: question sur un equipement specifique
+    equipement_trouve = None
+    for eq in EQUIPEMENTS:
+        if eq.lower() in msg_lower:
+            equipement_trouve = eq
+            break
+    if equipement_trouve and any(w in msg_lower for w in ['panne', 'risque', 'probabilite', 'pred']):
+        return jsonify({
+            'reponse': (
+                f"Consulte les predictions pour **{equipement_trouve}** directement sur le tableau de bord "
+                f"ou via l'API. Tu peux aussi decrire une cause specifique et je la classerai."
+            ),
+            'mode': 'regle',
+        })
+
+    # Mode LLM si cle disponible
+    if GROQ_API_KEY:
+        try:
+            from groq import Groq
+            client = Groq(api_key=GROQ_API_KEY)
+            messages = [{"role": "system", "content": system_prompt}]
+            for h in history[-10:]:
+                messages.append(h)
+            messages.append({"role": "user", "content": message})
+            response = client.chat.completions.create(
+                model="openai/gpt-oss-20b",
+                messages=messages,
+                temperature=0.3,
+                max_tokens=500,
+            )
+            reponse = response.choices[0].message.content
+            return jsonify({'reponse': reponse, 'mode': 'llm'})
+        except Exception as e:
+            pass
+
+    # Fallback conversationnel
+    salutations = ['bonjour', 'salut', 'hello', 'bonsoir', 'coucou']
+    if any(w in msg_lower for w in salutations):
+        return jsonify({
+            'reponse': (
+                "Bonjour ! Je suis l'assistant maintenance InnoFaso.\n\n"
+                "Je peux vous aider a :\n"
+                "- **Classer une cause de panne** : decrivez le symptome (ex: \"fuite d'huile sur le verin\")\n"
+                "- **Consulter les predictions** par equipement et mois\n"
+                "- **Diagnostiquer** un probleme sur un equipement\n\n"
+                "Que puis-je faire pour vous ?"
+            ),
+            'mode': 'fallback',
+        })
+
+    return jsonify({
+        'reponse': (
+            "Je n'ai pas encore de reponse toute faite pour cette question. "
+            "Quelques idees :\n"
+            "- Decrivez une **cause de panne** (ex: \"bruit anormal sur le compresseur\")\n"
+            "- Consultez les **predictions** dans le widget sur chaque carte equipement\n"
+            "- Configurez **GROQ_API_KEY** dans .env pour activer le mode conversationnel avance"
+        ),
+        'mode': 'fallback',
+    })
+
+
+@app.route('/api/bot/chat/stream', methods=['POST'])
+def bot_chat_stream():
+    data = request.get_json(silent=True)
+    if not data or 'message' not in data:
+        return jsonify({'error': 'Champ "message" requis'}), 400
+    message = data['message'].strip()
+    history = data.get('history', [])
+
+    def generate():
+        msg_lower = message.lower()
+
+        # Detection: demande d'API
+        if any(w in msg_lower for w in ['api', 'endpoint', 'curl', 'postman']):
+            equipements_str = ', '.join(EQUIPEMENTS[:5]) + ', ...'
+            txt = (
+                f"Endpoints disponibles:\n"
+                f"- GET /api/predict/ANNEE/MOIS → predictions par equipement\n"
+                f"- POST /api/classify → classer une cause (body: {{\"text\": \"...\"}})\n"
+                f"- POST /api/bot/chat → ce chatbot\n"
+                f"Equipements: {equipements_str}"
+            )
+            yield f"data: {{\"token\": {json.dumps(txt)}}}\n\n"
+            yield "data: {\"done\": true, \"mode\": \"regle\"}\n\n"
+            return
+
+        # Detection: cause de panne
+        cause_keywords = ['fuite', 'casse', 'rouille', 'usure', 'surchauffe', 'bruit', 'vibration',
+                          'bloque', 'dechire', 'courcircuit', 'surcharge', 'oxydation', 'frottement',
+                          'obstruction', 'bouchon', 'nettoyage', 'capteur', 'electrique', 'mecanique',
+                          'hydraulique', 'pneumatique']
+        if any(w in msg_lower for w in cause_keywords) and len(message) > 10:
+            try:
+                result = classify_panne(message) if NLP_AVAILABLE else {'categorie': 'N/A', 'confiance': 0.0}
+                categorie = result.get('categorie', 'Autre')
+                confiance = result.get('confiance', 0)
+                conf_pct = f"{confiance * 100:.0f}%"
+                suggestions = {
+                    'Mecanique': 'Verifier l\'usure des pieces, graisser, remplacer si necessaire.',
+                    'Electrique': 'Verifier le cablage, les fusibles, et les contacteurs.',
+                    'Hydraulique/Fuite': 'Identifier la source de la fuite, remplacer joint ou flexible.',
+                    'Instrumentation/Capteur': 'Nettoyer ou recalibrer le capteur, verifier la liaison.',
+                    'Nettoyage/Obstruction': 'Nettoyer l\'equipement, enlever les obstructions.',
+                    'Operateur/Utilisation': 'Former l\'operateur, verifier la procedure.',
+                    'Preventif planifie': 'Operation de maintenance preventive prevue.',
+                    'Autre': 'Diagnostic non standard, contacter le service technique.',
+                }
+                action = suggestions.get(categorie, '')
+                txt = (
+                    f"Cause classée : **{categorie}** (confiance {conf_pct})\n\n"
+                    f"Action suggérée : {action}\n\n"
+                    f"Widget *Classifier* sur la page Equipements pour tester d'autres causes."
+                )
+                yield f"data: {{\"token\": {json.dumps(txt)}}}\n\n"
+                yield "data: {\"done\": true, \"mode\": \"classify\"}\n\n"
+                return
+            except Exception:
+                pass
+
+        # Detection: equipement specifique
+        equipement_trouve = None
+        for eq in EQUIPEMENTS:
+            if eq.lower() in msg_lower:
+                equipement_trouve = eq
+                break
+        if equipement_trouve and any(w in msg_lower for w in ['panne', 'risque', 'probabilite', 'pred']):
+            txt = (
+                f"Consulte les predictions pour **{equipement_trouve}** sur le tableau de bord "
+                f"ou via l'API. Decris une cause specifique et je la classerai."
+            )
+            yield f"data: {{\"token\": {json.dumps(txt)}}}\n\n"
+            yield "data: {\"done\": true, \"mode\": \"regle\"}\n\n"
+            return
+
+        # Mode LLM streaming
+        if GROQ_API_KEY:
+            try:
+                from groq import Groq
+                client = Groq(api_key=GROQ_API_KEY)
+                system_prompt = (
+                    "Tu es un assistant expert en maintenance industrielle pour InnoFaso. "
+                    "Tu connais les equipements et les pannes. "
+                    "Reponds en francais de maniere concise et technique."
+                )
+                msgs = [{"role": "system", "content": system_prompt}]
+                for h in history[-10:]:
+                    msgs.append(h)
+                msgs.append({"role": "user", "content": message})
+                stream = client.chat.completions.create(
+                    model="openai/gpt-oss-20b",
+                    messages=msgs,
+                    temperature=0.3,
+                    max_tokens=500,
+                    stream=True,
+                )
+                for chunk in stream:
+                    token = chunk.choices[0].delta.content or ''
+                    if token:
+                        yield f"data: {{\"token\": {json.dumps(token)}}}\n\n"
+                yield "data: {\"done\": true, \"mode\": \"llm\"}\n\n"
+                return
+            except Exception as e:
+                yield f"data: {{\"token\": {json.dumps(f'Erreur LLM: {str(e)}')}}}\n\n"
+                yield "data: {\"done\": true, \"mode\": \"error\"}\n\n"
+                return
+
+        # Fallback
+        salutations = ['bonjour', 'salut', 'hello', 'bonsoir', 'coucou']
+        if any(w in msg_lower for w in salutations):
+            txt = (
+                "Bonjour ! Je suis l'assistant maintenance InnoFaso.\n\n"
+                "Je peux vous aider a :\n"
+                "- **Classer une cause de panne** : decrivez le symptome\n"
+                "- **Consulter les predictions** par equipement et mois\n"
+                "- **Diagnostiquer** un probleme sur un equipement\n\n"
+                "Que puis-je faire pour vous ?"
+            )
+            yield f"data: {{\"token\": {json.dumps(txt)}}}\n\n"
+            yield "data: {\"done\": true, \"mode\": \"fallback\"}\n\n"
+            return
+
+        txt = (
+            "Je n'ai pas de reponse pour cette question. "
+            "Quelques idees :\n"
+            "- Decrivez une **cause de panne** (ex: \"bruit anormal sur le compresseur\")\n"
+            "- Consultez les **predictions** dans le widget sur chaque carte equipement\n"
+            "- Configurez **GROQ_API_KEY** dans .env pour le mode avance"
+        )
+        yield f"data: {{\"token\": {json.dumps(txt)}}}\n\n"
+        yield "data: {\"done\": true, \"mode\": \"fallback\"}\n\n"
+
+    return Response(stream_with_context(generate()), mimetype='text/event-stream',
+                    headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
 
 @app.route('/api/predict/<int:annee>/<int:mois>')
 def predict_mois(annee, mois):
@@ -327,7 +751,7 @@ def predict_mois(annee, mois):
         return jsonify({'error': 'Année trop ancienne'}), 400
 
     X = preparer_features(annee, mois)
-    probas = model.predict_proba(X[features])[:,1]
+    probas = model.predict_proba(X[features])[:, 1]
 
     predictions = []
     for eq, proba in zip(EQUIPEMENTS, probas):
@@ -352,20 +776,20 @@ def predict_mois(annee, mois):
         }
     })
 
+
 @app.route('/api/predict/<int:annee>/<int:mois>/<path:equipement>')
 def predict_equipement(annee, mois, equipement):
     if equipement not in EQUIPEMENTS:
         return jsonify({'error': f'Équipement inconnu. Disponibles: {EQUIPEMENTS}'}), 404
 
     X = preparer_features(annee, mois)
-    row = X[X['Equipement'] == equipement]
+    row = X[X['equipement'] == equipement]
     proba = float(model.predict_proba(row[features])[0][1])
 
-    # Historique des 6 derniers mois pour contexte
-    hist_eq = HISTORIQUE[HISTORIQUE['Equipement'] == equipement].sort_values(
-        ['Annee','Mois_num']).tail(6)
-    historique_recent = hist_eq[['Annee','Mois_num','nb_interventions',
-                                  'duree_totale_h','nb_correctif']].to_dict('records')
+    hist_eq = HISTORIQUE[HISTORIQUE['equipement_nom'] == equipement].sort_values(
+        ['annee', 'mois_num']).tail(6)
+
+    historique_recent = hist_eq[['annee', 'mois_num', 'nb_correctif']].to_dict('records')
 
     return jsonify({
         'equipement':        equipement,
@@ -379,11 +803,15 @@ def predict_equipement(annee, mois, equipement):
         'historique_recent': historique_recent,
     })
 
+
 if __name__ == '__main__':
-    print("\n" + "="*55)
-    print("  InnoFaso IA — Service de prédiction de pannes")
-    print("="*55)
-    print("  Interface web : http://localhost:5001")
-    print("  API JSON      : http://localhost:5001/api/predict/2026/7")
-    print("="*55 + "\n")
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    port = int(os.getenv('FLASK_PORT', '5001'))
+    debug = os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
+    print("\n" + "=" * 55)
+    print("  InnoFaso IA v2 — Service de prédiction de pannes")
+    print(f"  Source données : {'PostgreSQL' if SOURCE_TYPE == 'postgres' else 'Excel (fallback)'}")
+    print("=" * 55)
+    print(f"  Interface web : http://localhost:{port}")
+    print(f"  API JSON      : http://localhost:{port}/api/predict/2026/7")
+    print("=" * 55 + "\n")
+    app.run(host='0.0.0.0', port=port, debug=debug)
