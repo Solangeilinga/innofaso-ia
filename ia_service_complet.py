@@ -480,6 +480,48 @@ def api_classify_batch():
     return jsonify({'results': results})
 
 
+def build_contexte_app():
+    equipements_str = '\n'.join(f'  - {e}' for e in EQUIPEMENTS)
+    try:
+        etats = {}
+        conn = db_loader.get_db_conn()
+        if conn:
+            cur = conn.cursor()
+            cur.execute("SELECT nom, etat FROM equipements WHERE actif = true ORDER BY nom")
+            for row in cur.fetchall():
+                etats[row[0]] = row[1]
+            cur.close()
+            conn.close()
+    except Exception:
+        etats = {}
+    etats_str = ''
+    if etats:
+        lignes = []
+        for e in EQUIPEMENTS:
+            s = etats.get(e, 'inconnu')
+            lbl = {'OPERATIONNEL': '✅ OK', 'EN_PANNE': '🔴 Panne', 'EN_MAINTENANCE': '🟡 Maintenance'}.get(s, s)
+            lignes.append(f'  - {e} → {lbl}')
+        etats_str = '\n'.join(lignes)
+    nb_histo = len(HISTORIQUE)
+    return (
+        f"Tu es l'assistant maintenance de l'application InnoFaso, "
+        f"un systeme de gestion de maintenance industrielle.\n\n"
+        f"L'application gere {len(EQUIPEMENTS)} equipements :\n{equipements_str}\n\n"
+        + (f"États actuels des equipements :\n{etats_str}\n\n" if etats_str else "")
+        + f"La base historique contient {nb_histo} enregistrements de maintenance.\n\n"
+        f"L'utilisateur peut :\n"
+        f"- Decrire une cause de panne → l'IA la classifie (Mecanique, Electrique, Hydraulique/Fuite, "
+        f"Instrumentation/Capteur, Nettoyage/Obstruction, Operateur/Utilisation, Preventif planifie, Autre)\n"
+        f"- Consulter les predictions de pannes par equipement et par mois\n"
+        f"- Diagnostiquer un probleme sur un equipement\n\n"
+        f"Reponds en francais de maniere concise, technique et en t'appuyant sur les donnees "
+        f"de l'application. Si l'utilisateur decrit un symptome, propose de le classer "
+        f"automatiquement. Si l'utilisateur demande une prediction pour un equipement specifique, "
+        f"donne les dernieres tendances disponibles. Sois toujours pertinent par rapport "
+        f"aux equipements listes ci-dessus."
+    )
+
+
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 
 @app.route('/api/bot/chat', methods=['POST'])
@@ -490,12 +532,7 @@ def bot_chat():
     message = data['message'].strip()
     history = data.get('history', [])
 
-    system_prompt = (
-        "Tu es un assistant expert en maintenance industrielle pour InnoFaso. "
-        "Tu connais les equipements (Air compressor, Filling machine, Mixer, Packing machine, etc.). "
-        "Tu aides a diagnostiquer les pannes, classer les causes et proposer des actions correctives. "
-        "Sois concis, technique et en francais."
-    )
+    system_prompt = build_contexte_app()
 
     msg_lower = message.lower()
 
@@ -583,27 +620,30 @@ def bot_chat():
             pass
 
     # Fallback conversationnel
+    eq_list = ', '.join(EQUIPEMENTS[:8]) + '...'
     salutations = ['bonjour', 'salut', 'hello', 'bonsoir', 'coucou']
     if any(w in msg_lower for w in salutations):
         return jsonify({
             'reponse': (
-                "Bonjour ! Je suis l'assistant maintenance InnoFaso.\n\n"
-                "Je peux vous aider a :\n"
-                "- **Classer une cause de panne** : decrivez le symptome (ex: \"fuite d'huile sur le verin\")\n"
-                "- **Consulter les predictions** par equipement et mois\n"
-                "- **Diagnostiquer** un probleme sur un equipement\n\n"
-                "Que puis-je faire pour vous ?"
+                f"Bonjour ! Je suis l'assistant maintenance InnoFaso.\n\n"
+                f"Je connais {len(EQUIPEMENTS)} equipements : {eq_list}\n\n"
+                f"Je peux :\n"
+                f"- Classer une cause de panne (décrivez le symptôme)\n"
+                f"- Donner les tendances de pannes par equipement\n"
+                f"- Repondre aux questions sur la maintenance\n\n"
+                f"Que puis-je faire pour vous ?"
             ),
             'mode': 'fallback',
         })
 
     return jsonify({
         'reponse': (
-            "Je n'ai pas encore de reponse toute faite pour cette question. "
-            "Quelques idees :\n"
-            "- Decrivez une **cause de panne** (ex: \"bruit anormal sur le compresseur\")\n"
-            "- Consultez les **predictions** dans le widget sur chaque carte equipement\n"
-            "- Configurez **GROQ_API_KEY** dans .env pour activer le mode conversationnel avance"
+            f"Je n'ai pas de reponse specifique a cette question. "
+            f"Les equipements suivis sont : {eq_list}\n"
+            f"Essayez de :\n"
+            f"- Decrire une cause de panne (ex: \"bruit anormal compresseur\")\n"
+            f"- Demander les predictions pour un equipement\n"
+            f"- Poser une question sur la maintenance d'un equipement specifique"
         ),
         'mode': 'fallback',
     })
@@ -687,11 +727,7 @@ def bot_chat_stream():
             try:
                 from groq import Groq
                 client = Groq(api_key=GROQ_API_KEY)
-                system_prompt = (
-                    "Tu es un assistant expert en maintenance industrielle pour InnoFaso. "
-                    "Tu connais les equipements et les pannes. "
-                    "Reponds en francais de maniere concise et technique."
-                )
+                system_prompt = build_contexte_app()
                 msgs = [{"role": "system", "content": system_prompt}]
                 for h in history[-10:]:
                     msgs.append(h)
@@ -715,26 +751,29 @@ def bot_chat_stream():
                 return
 
         # Fallback
+        eq_list = ', '.join(EQUIPEMENTS[:8]) + '...'
         salutations = ['bonjour', 'salut', 'hello', 'bonsoir', 'coucou']
         if any(w in msg_lower for w in salutations):
             txt = (
-                "Bonjour ! Je suis l'assistant maintenance InnoFaso.\n\n"
-                "Je peux vous aider a :\n"
-                "- **Classer une cause de panne** : decrivez le symptome\n"
-                "- **Consulter les predictions** par equipement et mois\n"
-                "- **Diagnostiquer** un probleme sur un equipement\n\n"
-                "Que puis-je faire pour vous ?"
+                f"Bonjour ! Je suis l'assistant maintenance InnoFaso.\n\n"
+                f"Je connais {len(EQUIPEMENTS)} equipements : {eq_list}\n\n"
+                f"Je peux :\n"
+                f"- Classer une cause de panne (decrirez le symptome)\n"
+                f"- Donner les tendances de pannes par equipement\n"
+                f"- Repondre aux questions sur la maintenance\n\n"
+                f"Que puis-je faire pour vous ?"
             )
             yield f"data: {{\"token\": {json.dumps(txt)}}}\n\n"
             yield "data: {\"done\": true, \"mode\": \"fallback\"}\n\n"
             return
 
         txt = (
-            "Je n'ai pas de reponse pour cette question. "
-            "Quelques idees :\n"
-            "- Decrivez une **cause de panne** (ex: \"bruit anormal sur le compresseur\")\n"
-            "- Consultez les **predictions** dans le widget sur chaque carte equipement\n"
-            "- Configurez **GROQ_API_KEY** dans .env pour le mode avance"
+            f"Je n'ai pas de reponse specifique. "
+            f"Les equipements suivis sont : {eq_list}\n"
+            f"Essayez de :\n"
+            f"- Decrire une cause de panne (ex: \"bruit anormal compresseur\")\n"
+            f"- Demander les predictions pour un equipement\n"
+            f"- Poser une question sur la maintenance d'un equipement specifique"
         )
         yield f"data: {{\"token\": {json.dumps(txt)}}}\n\n"
         yield "data: {\"done\": true, \"mode\": \"fallback\"}\n\n"
